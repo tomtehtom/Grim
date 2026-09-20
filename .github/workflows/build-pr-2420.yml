@@ -1,4 +1,4 @@
-name: Build Grim with PR 2420
+name: Build Latest Grim
 
 on:
   workflow_dispatch:
@@ -8,9 +8,10 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout Grim
+      - name: Checkout latest Grim
         uses: actions/checkout@v4
         with:
+          repository: GrimAnticheat/Grim
           fetch-depth: 0
 
       - name: Set up JDK 21
@@ -18,14 +19,7 @@ jobs:
         with:
           distribution: temurin
           java-version: 21
-
-      - name: Download PR 2420 diff
-        run: |
-          curl -L https://patch-diff.githubusercontent.com/raw/GrimAnticheat/Grim/pull/2420.diff -o pr-2420.diff
-
-      - name: Apply PR diff
-        run: |
-          git apply pr-2420.diff
+          cache: gradle
 
       - name: Make Gradle executable
         run: chmod +x ./gradlew
@@ -36,13 +30,15 @@ jobs:
       - name: Upload Bukkit jars
         uses: actions/upload-artifact@v4
         with:
-          name: grim-bukkit-pr-2420
+          name: grim-bukkit-latest
           path: |
             bukkit/build/libs/*.jar
+          if-no-files-found: warn
 
-      - name: Upload all jars (fallback)
+      - name: Upload all jars
         uses: actions/upload-artifact@v4
         with:
-          name: grim-all-jars-pr-2420
+          name: grim-all-jars-latest
           path: |
             **/build/libs/*.jar
+          if-no-files-found: warn
