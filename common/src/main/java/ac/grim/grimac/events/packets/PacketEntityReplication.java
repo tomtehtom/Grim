@@ -2,14 +2,19 @@ package ac.grim.grimac.events.packets;
 
 import ac.grim.grimac.GrimAPI;
 import ac.grim.grimac.api.config.ConfigManager;
-import ac.grim.grimac.checks.Check;
-import ac.grim.grimac.checks.type.PacketCheck;
+import ac.grim.grimac.checks.GrimProcessor;
+import ac.grim.grimac.checks.type.PacketReceiveListener;
+import ac.grim.grimac.checks.type.PacketSendListener;
 import ac.grim.grimac.player.GrimPlayer;
 import ac.grim.grimac.utils.anticheat.LogUtil;
+import ac.grim.grimac.utils.data.SprintingState;
 import ac.grim.grimac.utils.data.TrackerData;
+import ac.grim.grimac.utils.data.packetentity.DashableEntity;
 import ac.grim.grimac.utils.data.packetentity.PacketEntity;
 import ac.grim.grimac.utils.data.packetentity.PacketEntityHook;
 import ac.grim.grimac.utils.data.packetentity.PacketEntityTrackXRot;
+import ac.grim.grimac.utils.enums.Pose;
+import ac.grim.grimac.utils.nmsutil.EntityMetadataPoseUtil;
 import ac.grim.grimac.utils.viaversion.ViaVersionUtil;
 import com.github.retrooper.packetevents.PacketEvents;
 import com.github.retrooper.packetevents.event.PacketReceiveEvent;
@@ -48,13 +53,14 @@ import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerSp
 import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerSpawnPlayer;
 import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerUpdateAttributes;
 import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerWindowItems;
+import org.jetbrains.annotations.NotNull;
 
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicBoolean;
 
-public class PacketEntityReplication extends Check implements PacketCheck {
+public class PacketEntityReplication extends GrimProcessor implements PacketReceiveListener, PacketSendListener {
 
     private final AtomicBoolean hasSentPreWavePacket = new AtomicBoolean(true);
 
@@ -101,6 +107,12 @@ public class PacketEntityReplication extends Check implements PacketCheck {
                 entity.onMovement(isTickingReliably);
             }
         }
+
+        if (player.vehicleData.camelSprintingState == SprintingState.STOPPING) {
+            player.vehicleData.camelSprintingState = SprintingState.STOPPED;
+        } else if (player.vehicleData.camelSprintingState == SprintingState.STOPPED && player.isSprinting) { // For sprint desyncs
+            player.vehicleData.camelSprintingState = SprintingState.STARTED;
+        }
     }
 
     @Override
@@ -143,6 +155,7 @@ public class PacketEntityReplication extends Check implements PacketCheck {
             handleMoveEntity(event, move.getEntityId(), 0, 0, 0, move.getYaw() * 0.7111111F, move.getPitch() * 0.7111111F, true, false);
         } else if (event.getPacketType() == PacketType.Play.Server.ENTITY_METADATA) {
             WrapperPlayServerEntityMetadata entityMetadata = new WrapperPlayServerEntityMetadata(event);
+            schedulePoseTransition(entityMetadata, event);
             player.latencyUtils.addRealTimeTask(player.lastTransactionSent.get(), () -> player.compensatedEntities.updateEntityMetadata(entityMetadata.getEntityId(), entityMetadata.getEntityMetadata()));
         } else if (event.getPacketType() == PacketType.Play.Server.ENTITY_EQUIPMENT) {
             WrapperPlayServerEntityEquipment equipment = new WrapperPlayServerEntityEquipment(event);
@@ -379,10 +392,11 @@ public class PacketEntityReplication extends Check implements PacketCheck {
 
             final int destroyTransaction = player.lastTransactionSent.get() + 1;
             player.latencyUtils.addRealTimeTask(destroyTransaction, () -> {
-                for (int integer : destroyEntityIds) {
-                    player.compensatedEntities.removeEntity(integer);
-                    player.fireworks.removeFirework(integer);
-                    player.compensatedEntities.entitiesRemovedThisTick.add(integer);
+                for (int entityId : destroyEntityIds) {
+                    player.compensatedEntities.removeEntity(entityId);
+                    player.dashableEntities.removeEntity(entityId);
+                    player.fireworks.removeFirework(entityId);
+                    player.compensatedEntities.entitiesRemovedThisTick.add(entityId);
                 }
             });
 
@@ -506,7 +520,7 @@ public class PacketEntityReplication extends Check implements PacketCheck {
                 xRotEntity.steps = entity.isBoat ? 10 : 3;
             }
 
-            entity.onFirstTransaction(isRelative, hasPos, deltaX, deltaY, deltaZ, player);
+            entity.onFirstTransaction(isRelative, hasPos, deltaX, deltaY, deltaZ, yaw, pitch, player);
         });
 
         player.latencyUtils.addRealTimeTask(lastTrans + 1, () -> {
@@ -524,10 +538,68 @@ public class PacketEntityReplication extends Check implements PacketCheck {
         player.compensatedEntities.serverPositionsMap.put(entityID, new TrackerData(position.getX(), position.getY(), position.getZ(), xRot, yRot, type, player.lastTransactionSent.get()));
 
         player.latencyUtils.addRealTimeTask(player.lastTransactionSent.get(), () -> {
-            player.compensatedEntities.addEntity(entityID, uuid, type, position, xRot, extraData);
+            PacketEntity entity = player.compensatedEntities.addEntity(entityID, uuid, type, position, xRot, extraData);
+            if (entity instanceof DashableEntity dashable) {
+                player.dashableEntities.addEntity(entityID, dashable);
+            }
+
             if (entityMetadata != null) {
+                if (EntityMetadataPoseUtil.usesPoseMetadata(entity) && player.getClientVersion().isNewerThanOrEquals(ClientVersion.V_1_14)) {
+                    Pose initialPose = EntityMetadataPoseUtil.getPoseFromMetadata(entityMetadata);
+                    if (initialPose != null) {
+                        entity.currentPose = initialPose;
+                    }
+                }
+
                 player.compensatedEntities.updateEntityMetadata(entityID, entityMetadata);
             }
+        });
+    }
+
+    private void schedulePoseTransition(WrapperPlayServerEntityMetadata entityMetadata, PacketSendEvent event) {
+        if (player.getClientVersion().isOlderThan(ClientVersion.V_1_14)) return;
+
+        int entityId = entityMetadata.getEntityId();
+        if (entityId == player.entityID) return;
+
+        Pose newPose = EntityMetadataPoseUtil.getPoseFromMetadata(entityMetadata.getEntityMetadata());
+        if (newPose == null) return;
+
+        boolean shouldTrackPoseTransition = false;
+        PacketEntity entity = player.compensatedEntities.getEntity(entityId);
+        if (entity != null) {
+            shouldTrackPoseTransition = EntityMetadataPoseUtil.usesPoseMetadata(entity);
+        } else {
+            // If the client didn't respond to the spawn packet yet, we need to check if we should track the pose transition based on the entity type
+            // is there a better way to do this?
+            TrackerData trackedEntity = player.compensatedEntities.getTrackedEntity(entityId);
+            if (trackedEntity != null) {
+                shouldTrackPoseTransition = EntityMetadataPoseUtil.usesPoseMetadata(trackedEntity.getEntityType());
+            }
+        }
+
+        if (!shouldTrackPoseTransition) return;
+
+        player.sendTransaction();
+        player.latencyUtils.addRealTimeTask(player.lastTransactionSent.get(), () -> {
+            PacketEntity target = player.compensatedEntities.getEntity(entityId);
+            if (target == null) {
+                return;
+            }
+
+            target.beginPoseTransition(newPose);
+        });
+
+        event.getTasksAfterSend().add(() -> {
+            player.sendTransaction();
+            player.latencyUtils.addRealTimeTask(player.lastTransactionSent.get(), () -> {
+                PacketEntity target = player.compensatedEntities.getEntity(entityId);
+                if (target == null) {
+                    return;
+                }
+
+                target.completePoseTransition(newPose);
+            });
         });
     }
 
@@ -537,9 +609,10 @@ public class PacketEntityReplication extends Check implements PacketCheck {
                 (player.compensatedEntities.serverPlayerVehicle != null && entityID == player.compensatedEntities.serverPlayerVehicle);
     }
 
-    public void onEndOfTickEvent() {
+    public void onEndOfTickEvent(boolean async, boolean flush) {
         // Only send a transaction at the end of the tick if we are tracking players
-        player.sendTransaction(true); // We injected before vanilla flushes :) we don't need to flush
+        player.sendTransaction(async);
+        if (flush) player.user.flushPackets();
     }
 
     public void tickStartTick() {
@@ -547,7 +620,7 @@ public class PacketEntityReplication extends Check implements PacketCheck {
     }
 
     @Override
-    public void onReload(ConfigManager config) {
+    public void onReload(@NotNull ConfigManager config) {
         maxFireworkBoostPing = config.getIntElse("max-ping-firework-boost", 1000);
     }
 

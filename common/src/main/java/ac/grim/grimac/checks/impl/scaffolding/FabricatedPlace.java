@@ -1,15 +1,18 @@
 package ac.grim.grimac.checks.impl.scaffolding;
 
+import ac.grim.grimac.api.storage.verbose.Verbose;
 import ac.grim.grimac.checks.CheckData;
 import ac.grim.grimac.checks.type.BlockPlaceCheck;
+import ac.grim.grimac.checks.type.BlockPlaceListener;
 import ac.grim.grimac.player.GrimPlayer;
 import ac.grim.grimac.utils.anticheat.update.BlockPlace;
 import ac.grim.grimac.utils.nmsutil.Materials;
 import com.github.retrooper.packetevents.protocol.world.states.type.StateTypes;
 import com.github.retrooper.packetevents.util.Vector3f;
 
-@CheckData(name = "FabricatedPlace", description = "Sent out of bounds cursor position")
-public class FabricatedPlace extends BlockPlaceCheck {
+@CheckData(name = "FabricatedPlace", stableKey = "grim.scaffolding.fabricated_place", description = "Sent out of bounds cursor position")
+public class FabricatedPlace extends BlockPlaceCheck implements BlockPlaceListener {
+    private static final Verbose V = Verbose.of("cursor={cursor} limit={f64:%.16f}");
 
     /**
      * MAX_DOUBLE_ERROR:
@@ -61,8 +64,9 @@ public class FabricatedPlace extends BlockPlaceCheck {
                 cursor.getZ() < minBound - MAX_DOUBLE_ERROR) {
 
             // Alert logic
-            String debug = String.format("cursor=%s limit=%.16f", cursor, minBound - MAX_DOUBLE_ERROR);
-            if (flagAndAlert(debug) && shouldModifyPackets() && shouldCancel()) {
+            double limit = minBound - MAX_DOUBLE_ERROR;
+            var buf = V.write(verbose()).cursor(cursor.x, cursor.y, cursor.z).f64(limit);
+            if (flag(buf) && shouldModifyPackets() && shouldCancel()) {
                 place.resync();
             }
             return;
@@ -71,20 +75,22 @@ public class FabricatedPlace extends BlockPlaceCheck {
         // ====================================================================================
         // UPPER BOUND CHECK (> 1.0 or > 1.5)
         // ====================================================================================
-        // Why ADD FLOAT_STEP?
-        // Near 1.0, 'float' resolution is coarse (~1.19E-7).
-        // If the client calculates 1.000000000000004 (Double Error), the cast to float
-        // might snap it to exactly 1.0 OR 1.0000001 depending on the rounding mode.
-        // We must permit the cursor to be one full "Float Step" outside the bounds.
-        double upperTolerance = MAX_DOUBLE_ERROR + FLOAT_STEP_AT_ONE;
+        // Near 1.0, the "Float Step" is E-7. This is 16x larger than the Double error.
+        // If the calculation is slightly off, it might snap to the NEXT float.
+        // We tolerate exactly one "Float Step" of overflow.
+        double upperTolerance = FLOAT_STEP_AT_ONE;
+
+        // Note: Effectively Math.max(MAX_DOUBLE_ERROR, FLOAT_STEP_AT_ONE)
+        // but since FLOAT_STEP is always larger in MC coordinates, we just use it.
 
         if (cursor.getX() > maxBound + upperTolerance ||
                 cursor.getY() > maxBound + upperTolerance ||
                 cursor.getZ() > maxBound + upperTolerance) {
 
             // Alert logic
-            String debug = String.format("cursor=%s limit=%.16f", cursor, maxBound + upperTolerance);
-            if (flagAndAlert(debug) && shouldModifyPackets() && shouldCancel()) {
+            double limit = maxBound + upperTolerance;
+            var buf = V.write(verbose()).cursor(cursor.x, cursor.y, cursor.z).f64(limit);
+            if (flag(buf) && shouldModifyPackets() && shouldCancel()) {
                 place.resync();
             }
         }

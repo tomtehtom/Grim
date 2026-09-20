@@ -20,6 +20,7 @@ import ac.grim.grimac.utils.collisions.datatypes.SimpleCollisionBox;
 import ac.grim.grimac.utils.data.ReachInterpolationData;
 import ac.grim.grimac.utils.data.TrackedPosition;
 import ac.grim.grimac.utils.data.attribute.ValuedAttribute;
+import ac.grim.grimac.utils.enums.Pose;
 import com.github.retrooper.packetevents.protocol.attribute.Attribute;
 import com.github.retrooper.packetevents.protocol.attribute.Attributes;
 import com.github.retrooper.packetevents.protocol.entity.type.EntityType;
@@ -31,6 +32,7 @@ import com.github.retrooper.packetevents.util.Vector3d;
 import it.unimi.dsi.fastutil.objects.Object2IntMap;
 import it.unimi.dsi.fastutil.objects.Object2IntOpenHashMap;
 import lombok.Getter;
+import org.jetbrains.annotations.Nullable;
 
 import java.util.ArrayList;
 import java.util.EnumMap;
@@ -57,9 +59,18 @@ public class PacketEntity extends TypedPacketEntity {
     public boolean hasGravity = true;
     private ReachInterpolationData oldPacketLocation;
     private ReachInterpolationData newPacketLocation;
+    /**
+     * Rotation the current interpolation is heading towards, mirroring vanilla
+     * {@code InterpolationHandler}'s target yRot/xRot. Only used to decide whether an
+     * incoming packet restates the running interpolation; the hitbox itself is
+     * position-only. Grim convention: xRot is yaw, yRot is pitch.
+     */
+    private float interpolationTargetXRot, interpolationTargetYRot;
     private Object2IntMap<PotionType> potionsMap = null;
     public boolean trackEntityEquipment = false;
     private EnumMap<EquipmentSlot, ItemStack> equipment = null;
+    public Pose currentPose = Pose.STANDING;
+    public Pose transitionalPose = null;
 
     public PacketEntity(GrimPlayer player, EntityType type) {
         super(type);
@@ -90,11 +101,22 @@ public class PacketEntity extends TypedPacketEntity {
 
     protected void initAttributes(GrimPlayer player) {
         trackAttribute(ValuedAttribute.ranged(Attributes.SCALE, 1.0, 0.0625, 16)
-                .requiredVersion(player, ClientVersion.V_1_20_5));
+                .requiredVersion(player, ClientVersion.V_1_20_5)
+                .withGetRewriter(this::clampScale));
         trackAttribute(ValuedAttribute.ranged(Attributes.STEP_HEIGHT, 0.6f, 0, 10)
                 .requiredVersion(player, ClientVersion.V_1_20_5));
         trackAttribute(ValuedAttribute.ranged(Attributes.GRAVITY, 0.08, -1, 1)
                 .requiredVersion(player, ClientVersion.V_1_20_5));
+        trackAttribute(ValuedAttribute.ranged(Attributes.AIR_DRAG_MODIFIER, 1.0, 0, 2048)
+                .requiredVersion(player, ClientVersion.V_26_2));
+        trackAttribute(ValuedAttribute.ranged(Attributes.BOUNCINESS, 0.0, 0, 1)
+                .requiredVersion(player, ClientVersion.V_26_2));
+        trackAttribute(ValuedAttribute.ranged(Attributes.FRICTION_MODIFIER, 1.0, 0, 2048)
+                .requiredVersion(player, ClientVersion.V_26_2));
+    }
+
+    public double clampScale(double scale) {
+        return scale;
     }
 
     public Optional<ValuedAttribute> getAttribute(Attribute attribute) {
@@ -105,15 +127,24 @@ public class PacketEntity extends TypedPacketEntity {
     public void setAttribute(Attribute attribute, double value) {
         ValuedAttribute property = attributeMap.get(attribute);
         if (property == null) {
-            throw new IllegalArgumentException("Cannot set attribute " + attribute.getName() + " for entity " + type.getName() + "!");
+            throw new IllegalArgumentException("Cannot set attribute " + attribute.getName() + " for entity " + getType().getName() + "!");
         }
         property.override(value);
+    }
+
+    public void beginPoseTransition(Pose targetPose) {
+        this.transitionalPose = targetPose;
+    }
+
+    public void completePoseTransition(Pose finalPose) {
+        this.currentPose = finalPose;
+        this.transitionalPose = null;
     }
 
     public double getAttributeValue(Attribute attribute) {
         final ValuedAttribute property = attributeMap.get(attribute);
         if (property == null) {
-            throw new IllegalArgumentException("Cannot get attribute " + attribute.getName() + " for entity " + type.getName() + "!");
+            throw new IllegalArgumentException("Cannot get attribute " + attribute.getName() + " for entity " + getType().getName() + "!");
         }
         return property.get();
     }
@@ -124,7 +155,8 @@ public class PacketEntity extends TypedPacketEntity {
 
     // Set the old packet location to the new one
     // Set the new packet location to the updated packet location
-    public void onFirstTransaction(boolean relative, boolean hasPos, double relX, double relY, double relZ, GrimPlayer player) {
+    public void onFirstTransaction(boolean relative, boolean hasPos, double relX, double relY, double relZ,
+                                   @Nullable Float packetXRot, @Nullable Float packetYRot, GrimPlayer player) {
         if (hasPos) {
             if (relative) {
                 // This only matters for 1.9+ clients, but it won't hurt 1.8 clients either... align for imprecision
@@ -146,23 +178,63 @@ public class PacketEntity extends TypedPacketEntity {
                 }
             }
         }
+
+        // Vanilla's InterpolationHandler (1.21.5+) in 1.21.9+ only restarts the lerp when the
+        // incoming target differs from the one it is already heading towards, so a
+        // packet that merely restates the current target is a no-op client side.
+        // Restarting it here instead leaves our interpolation permanently trailing
+        // the client whenever a server re-sends the same position, which reads as
+        // the entity hitbox sitting slightly off and false flags Hitboxes/Reach.
+        //
+        // Strictly 1.21.9+. InterpolationHandler exists from 1.21.5 but without this
+        // equality guard, so 1.21.5 -> 1.21.8 really does restart on every packet
+        // (the same absence that reintroduced MC-255263 for those builds), as does
+        // the pre-1.21.5 Entity#lerpTo path. Restarting unconditionally is correct
+        // there, which is why the freeze modelling below stays untouched: its
+        // version range ends at 1.21.9, exactly where this begins.
+        //
+        // This covers rotation-only packets too. Vanilla routes them through
+        // Entity#moveOrInterpolateTo(yRot, xRot), whose absent position defaults to
+        // InterpolationHandler#position() - the current interpolation target while
+        // steps > 0 - so the position term compares equal and an unchanged rotation
+        // makes the whole packet a no-op.
+        //
+        // Skipping is safe for transaction splitting. We leave oldPacketLocation
+        // untouched, so an in-flight uncertainty window from an earlier packet is
+        // preserved rather than collapsed, and the redundant packet's own
+        // onSecondTransaction only clears a window that its transaction already
+        // proves the client has passed.
+        if (player.getClientVersion().isNewerThanOrEquals(ClientVersion.V_1_21_9)
+                && newPacketLocation.restatesTarget(trackedServerPosition.getPos(),
+                        packetXRot, packetYRot, interpolationTargetXRot, interpolationTargetYRot)) {
+            return;
+        }
+
+        if (packetXRot != null && packetYRot != null) {
+            this.interpolationTargetXRot = packetXRot;
+            this.interpolationTargetYRot = packetYRot;
+        }
+
         this.oldPacketLocation = newPacketLocation;
-        // TODO make config option to rewrite Rots to PosRots instead of expanding to handle this false
-        // https://bugs.mojang.com/browse/MC-255263
+        // BUG FIX LOGIC for https://bugs.mojang.com/browse/MC-255263
+        // 1. We MUST check !hasPos. If hasPos is true, we must let standard interpolation (4-arg) run.
+        // 2. The 3-arg constructor is for versions where the client FREEZES (targets current pos) when rot only packets come in
         if (!hasPos &&
-                // Fixed in 1.21.9 again
-                (player.getClientVersion().isOlderThan(ClientVersion.V_1_21_9) && player.getClientVersion().isNewerThan(ClientVersion.V_1_21_4)) ||
-                (player.getClientVersion().isOlderThan(ClientVersion.V_1_20_2) && player.getClientVersion().isNewerThan(ClientVersion.V_1_14_4))
+                // Logic for versions that FREEZE (Target = Current)
+                // 1.21.5 -> 1.21.8 (regression)
+                ((player.getClientVersion().isOlderThan(ClientVersion.V_1_21_9) && player.getClientVersion().isNewerThan(ClientVersion.V_1_21_4)) ||
+                        // 1.15 -> 1.20.1 (Old bug)
+                        (player.getClientVersion().isOlderThan(ClientVersion.V_1_20_2) && player.getClientVersion().isNewerThan(ClientVersion.V_1_14_4)))
         ) {
-            this.newPacketLocation = new ReachInterpolationData(player, new SimpleCollisionBox(
-                    trackedServerPosition.getPos().getX(),
-                    trackedServerPosition.getPos().getY(),
-                    trackedServerPosition.getPos().getZ(),
-                    trackedServerPosition.getPos().getX(),
-                    trackedServerPosition.getPos().getY(),
-                    trackedServerPosition.getPos().getZ()
-            ), trackedServerPosition, this);
+            // Apply Freeze Fix (Start = Box, Target = Box)
+            this.newPacketLocation = new ReachInterpolationData(
+                    player,
+                    oldPacketLocation.getPossibleLocationCombined(),
+                    this
+            );
         } else {
+            // Standard Interpolation (Start = Box, Target = ServerPos)
+            // This naturally fixes the "Slowdown"/Interpolation Reset in 1.20.2-1.21.4 and 1.21.9+ resetting the lerp timer
             this.newPacketLocation = new ReachInterpolationData(player, oldPacketLocation.getPossibleLocationCombined(), trackedServerPosition, this);
         }
 
