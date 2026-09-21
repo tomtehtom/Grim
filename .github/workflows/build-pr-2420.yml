@@ -1,44 +1,567 @@
-name: Build Latest Grim
+name: Build GrimAC Paper 26.3 Patched
 
 on:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     steps:
-      - name: Checkout latest Grim
-        uses: actions/checkout@v4
+      # ============================================================
+      # GRIM 26.3 PR
+      # ============================================================
+
+      - name: Checkout GrimAC
+        uses: actions/checkout@v5
         with:
           repository: GrimAnticheat/Grim
+          ref: "2.0"
+          path: Grim
           fetch-depth: 0
 
-      - name: Set up JDK 21
-        uses: actions/setup-java@v4
+      - name: Fetch Grim 26.3 PR
+        working-directory: Grim
+        shell: bash
+        run: |
+          git fetch origin pull/2888/head:grim-26.3
+          git checkout grim-26.3
+
+          echo "=== Grim 26.3 HEAD ==="
+          git log -5 --oneline
+
+      # ============================================================
+      # GRIM PACKETEVENTS FORK
+      # ============================================================
+
+      - name: Checkout Grim PacketEvents fork
+        uses: actions/checkout@v5
+        with:
+          repository: GrimAnticheat/packetevents
+          path: packetevents
+          fetch-depth: 0
+
+      # ============================================================
+      # JAVA
+      # ============================================================
+
+      - name: Set up JDK 25
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
-          java-version: 21
+          java-version: "25"
           cache: gradle
+          cache-dependency-path: |
+            Grim/**/*.gradle*
+            Grim/**/*.toml
+            packetevents/**/*.gradle*
+            packetevents/**/*.toml
 
       - name: Make Gradle executable
-        run: chmod +x ./gradlew
+        run: |
+          chmod +x Grim/gradlew
 
-      - name: Build Grim
-        run: ./gradlew build
+          if [ -f packetevents/gradlew ]; then
+            chmod +x packetevents/gradlew
+          fi
 
-      - name: Upload Bukkit jars
+      - name: Show versions
+        shell: bash
+        run: |
+          echo "================ JAVA ================"
+          java -version
+
+          echo ""
+          echo "================ GRIM ================"
+          git -C Grim log -1 --oneline
+
+          echo ""
+          echo "============ PACKETEVENTS ============"
+          git -C packetevents log -1 --oneline
+
+      # ============================================================
+      # INSPECT THE 26.3 SOURCE
+      # ============================================================
+
+      - name: Inspect platform player implementation
+        shell: bash
+        run: |
+          echo "=== PlatformPlayerFactory ==="
+
+          grep -Rni \
+            --include="*.java" \
+            "getFromUUID" \
+            Grim/bukkit/src \
+            Grim/common/src \
+            | head -50 || true
+
+          echo ""
+          echo "=== BukkitPlatformPlayer ==="
+
+          grep -Rni \
+            --include="*.java" \
+            "class BukkitPlatformPlayer" \
+            Grim/bukkit/src \
+            || true
+
+          echo ""
+          echo "=== Command manager ==="
+
+          grep -Rni \
+            --include="*.java" \
+            -E "createCloudCommandManager|CloudCommandService|registerCommands" \
+            Grim/bukkit/src \
+            Grim/common/src \
+            | head -100 || true
+
+      # ============================================================
+      # FIX EARLY-JOIN PLATFORM PLAYER
+      #
+      # Grim's platformPlayer is intentionally nullable while the
+      # PacketEvents user is being created.
+      #
+      # On Paper we can resolve the Bukkit Player directly by UUID.
+      # This prevents alert/verbose state setup from running with a
+      # null PlatformPlayer during the join transition.
+      # ============================================================
+
+      - name: Patch early join platform player handling
+        shell: bash
+        run: |
+          FILE="Grim/common/src/main/java/ac/grim/grimac/player/GrimPlayer.java"
+
+          echo "=== Existing pollData block ==="
+
+          grep -n -A12 -B5 \
+            "this.platformPlayer == null" \
+            "$FILE" || true
+
+          python3 <<'PY'
+          from pathlib import Path
+
+          path = Path(
+              "Grim/common/src/main/java/"
+              "ac/grim/grimac/player/GrimPlayer.java"
+          )
+
+          text = path.read_text()
+
+          old = """\
+          if (this.platformPlayer == null) {
+              this.platformPlayer = GrimAPI.INSTANCE.getPlatformPlayerFactory().getFromUUID(uuid);
+              updatePermissions();
+          }
+          """
+
+          new = """\
+          if (this.platformPlayer == null) {
+              this.platformPlayer = GrimAPI.INSTANCE.getPlatformPlayerFactory().getFromUUID(uuid);
+
+              // Paper 26.3 can briefly expose the PacketEvents user
+              // before Bukkit's platform player is available.
+              //
+              // Do not run permission/alert initialization until the
+              // platform player has actually been resolved.
+              if (this.platformPlayer != null) {
+                  updatePermissions();
+              }
+          }
+          """
+
+          if old not in text:
+              print("Exact pollData block was not found.")
+
+              # Check whether the null guard is already present.
+              if (
+                  "if (this.platformPlayer != null)" in text
+                  and "updatePermissions();" in text
+              ):
+                  print("A platformPlayer null guard appears to already exist.")
+              else:
+                  raise SystemExit(
+                      "ERROR: Could not safely patch GrimPlayer.java"
+                  )
+          else:
+              text = text.replace(old, new, 1)
+              path.write_text(text)
+              print("Patched GrimPlayer.pollData()")
+          PY
+
+          echo ""
+          echo "=== Patched block ==="
+
+          grep -n -A18 -B5 \
+            "this.platformPlayer == null" \
+            "$FILE" || true
+
+      # ============================================================
+      # FIX ALERT MANAGER EARLY-JOIN NPE
+      #
+      # Alert state is not useful until a Bukkit PlatformPlayer
+      # exists. Instead of crashing the async tick repeatedly,
+      # ignore alert/verbose state updates during that tiny join
+      # window.
+      # ============================================================
+
+      - name: Patch AlertManager early join handling
+        shell: bash
+        run: |
+          FILE="Grim/common/src/main/java/ac/grim/grimac/manager/AlertManagerImpl.java"
+
+          echo "=== Current AlertManager ==="
+
+          grep -n -A15 -B10 \
+            "requirePlatformPlayerFromUser" \
+            "$FILE" || true
+
+          python3 <<'PY'
+          from pathlib import Path
+
+          path = Path(
+              "Grim/common/src/main/java/"
+              "ac/grim/grimac/manager/AlertManagerImpl.java"
+          )
+
+          text = path.read_text()
+
+          # The PR/build currently deliberately throws here when
+          # platformPlayer has not yet been assigned.
+          #
+          # Replace calls in the toggle setters with a safe lookup.
+
+          replacements = {
+              """\
+          PlatformPlayer player = requirePlatformPlayerFromUser(user);
+          alertPlayers.add(player);
+          """:
+              """\
+          PlatformPlayer player = user.platformPlayer;
+          if (player == null) {
+              return;
+          }
+          alertPlayers.add(player);
+          """,
+
+              """\
+          PlatformPlayer player = requirePlatformPlayerFromUser(user);
+          verbosePlayers.add(player);
+          """:
+              """\
+          PlatformPlayer player = user.platformPlayer;
+          if (player == null) {
+              return;
+          }
+          verbosePlayers.add(player);
+          """
+          }
+
+          changed = False
+
+          for old, new in replacements.items():
+              if old in text:
+                  text = text.replace(old, new)
+                  changed = True
+
+          # More general protection for methods which obtain the
+          # PlatformPlayer through the helper.
+          text = text.replace(
+              """\
+          PlatformPlayer platformPlayer = requirePlatformPlayerFromUser(user);
+          """,
+              """\
+          PlatformPlayer platformPlayer = user.platformPlayer;
+          if (platformPlayer == null) {
+              return;
+          }
+          """
+          )
+
+          if changed:
+              path.write_text(text)
+              print("Applied AlertManager early-join guards.")
+          else:
+              print(
+                  "No exact setter pattern replaced; "
+                  "source may already differ in PR #2888."
+              )
+          PY
+
+          echo ""
+          echo "=== Result ==="
+
+          grep -n -A20 -B10 \
+            "setVerboseEnabled" \
+            "$FILE" || true
+
+      # ============================================================
+      # CLOUD COMMAND COMPATIBILITY
+      #
+      # The old crash was triggered while Cloud registered its
+      # Bukkit ItemStackParser. Paper 26.3 no longer exposes the
+      # CraftItemStack methods that that Cloud version expects.
+      #
+      # Grim does not need the ItemStack parser for its normal
+      # /grim command tree, so remove automatic Bukkit parser
+      # registration from the shaded Cloud path where possible.
+      # ============================================================
+
+      - name: Patch Cloud command registration for Paper 26.3
+        shell: bash
+        run: |
+          FILE="Grim/bukkit/src/main/java/ac/grim/grimac/platform/bukkit/GrimACBukkitLoaderPlugin.java"
+
+          echo "=== Cloud command manager source ==="
+
+          grep -n -A100 -B20 \
+            "createCloudCommandManager" \
+            "$FILE" || true
+
+          python3 <<'PY'
+          from pathlib import Path
+
+          path = Path(
+              "Grim/bukkit/src/main/java/"
+              "ac/grim/grimac/platform/bukkit/"
+              "GrimACBukkitLoaderPlugin.java"
+          )
+
+          text = path.read_text()
+
+          print("Inspecting command manager construction...")
+
+          # Keep this deliberately conservative. The 26.3 PR may
+          # change this source while it is under development.
+          #
+          # We only remove explicit BukkitParsers registration if
+          # Grim itself performs it. We do NOT blindly rewrite the
+          # command tree.
+
+          lines = text.splitlines()
+          output = []
+          removed = []
+
+          for line in lines:
+              stripped = line.strip()
+
+              if (
+                  "BukkitParsers.register" in stripped
+                  or ".registerBukkitParsers(" in stripped
+              ):
+                  removed.append(line)
+                  continue
+
+              output.append(line)
+
+          if removed:
+              path.write_text("\n".join(output) + "\n")
+
+              print("Removed incompatible Bukkit parser registration:")
+              for line in removed:
+                  print("  " + line.strip())
+          else:
+              print(
+                  "No explicit BukkitParsers registration exists in "
+                  "GrimACBukkitLoaderPlugin; leaving command source unchanged."
+              )
+          PY
+
+      # ============================================================
+      # SHOW CLOUD VERSIONS
+      # ============================================================
+
+      - name: Show Cloud dependencies
+        working-directory: Grim
+        shell: bash
+        run: |
+          echo "=== Cloud dependency versions ==="
+
+          grep -n \
+            -E "cloud|incendo" \
+            libs.versions.toml \
+            || true
+
+      # ============================================================
+      # COMPILE
+      # ============================================================
+
+      - name: Compile Grim common first
+        working-directory: Grim
+        shell: bash
+        run: |
+          ./gradlew \
+            :common:compileJava \
+            --stacktrace \
+            --no-daemon
+
+      # ============================================================
+      # BUILD BUKKIT
+      # ============================================================
+
+      - name: Build GrimAC Bukkit
+        working-directory: Grim
+        shell: bash
+        run: |
+          ./gradlew \
+            clean \
+            :bukkit:build \
+            --stacktrace \
+            --no-daemon
+
+      # ============================================================
+      # FIND JAR
+      # ============================================================
+
+      - name: Show generated JARs
+        shell: bash
+        run: |
+          echo "=== Generated Bukkit JARs ==="
+
+          find Grim/bukkit/build/libs \
+            -maxdepth 1 \
+            -type f \
+            -name "*.jar" \
+            -print \
+            | sort
+
+      - name: Find production GrimAC JAR
+        id: grimjar
+        shell: bash
+        run: |
+          JAR=$(find Grim/bukkit/build/libs \
+            -maxdepth 1 \
+            -type f \
+            -name "grimac-bukkit-*.jar" \
+            ! -name "*sources*" \
+            ! -name "*javadoc*" \
+            | head -1)
+
+          if [ -z "$JAR" ]; then
+            echo "ERROR: GrimAC Bukkit JAR not found."
+
+            find Grim/bukkit/build/libs \
+              -maxdepth 1 \
+              -type f \
+              -print || true
+
+            exit 1
+          fi
+
+          echo "JAR=$JAR"
+          echo "jar=$JAR" >> "$GITHUB_OUTPUT"
+
+      # ============================================================
+      # VERIFY IMPORTANT COMPONENTS
+      # ============================================================
+
+      - name: Verify PacketEvents
+        shell: bash
+        run: |
+          JAR="${{ steps.grimjar.outputs.jar }}"
+
+          COUNT=$(unzip -l "$JAR" \
+            | grep -c \
+            "ac/grim/grimac/shaded/io/github/retrooper/packetevents" \
+            || true)
+
+          echo "PacketEvents classes: $COUNT"
+
+          if [ "$COUNT" -eq 0 ]; then
+            echo "ERROR: PacketEvents not shaded."
+            exit 1
+          fi
+
+      - name: Verify Cloud commands
+        shell: bash
+        run: |
+          JAR="${{ steps.grimjar.outputs.jar }}"
+
+          echo "=== Cloud classes ==="
+
+          COUNT=$(unzip -l "$JAR" \
+            | grep -c \
+            "ac/grim/grimac/shaded/incendo/cloud" \
+            || true)
+
+          echo "Cloud classes: $COUNT"
+
+          if [ "$COUNT" -eq 0 ]; then
+            echo "ERROR: Cloud command framework not shaded."
+            exit 1
+          fi
+
+          echo ""
+          echo "=== Grim command classes ==="
+
+          unzip -l "$JAR" \
+            | grep \
+            "ac/grim/grimac/command/" \
+            | head -50
+
+      # ============================================================
+      # PREPARE OUTPUT
+      # ============================================================
+
+      - name: Prepare final JAR
+        shell: bash
+        run: |
+          mkdir -p output
+
+          cp \
+            "${{ steps.grimjar.outputs.jar }}" \
+            output/GrimAC-Paper-26.3.jar
+
+          echo "=== Final build ==="
+          ls -lh output/GrimAC-Paper-26.3.jar
+
+          echo ""
+          sha256sum output/GrimAC-Paper-26.3.jar
+
+      # ============================================================
+      # BUILD INFORMATION
+      # ============================================================
+
+      - name: Save build information
+        shell: bash
+        run: |
+          {
+            echo "Grim Paper 26.3 patched build"
+            echo ""
+
+            echo "Grim:"
+            git -C Grim log -1 --format='%H %s'
+
+            echo ""
+            echo "PacketEvents:"
+            git -C packetevents log -1 --format='%H %s'
+
+            echo ""
+            echo "Cloud dependencies:"
+            grep -E \
+              "cloud|incendo" \
+              Grim/libs.versions.toml \
+              || true
+
+            echo ""
+            echo "Java:"
+            java -version 2>&1
+
+          } > output/build-info.txt
+
+          cat output/build-info.txt
+
+      # ============================================================
+      # UPLOAD
+      # ============================================================
+
+      - name: Upload GrimAC Paper 26.3
         uses: actions/upload-artifact@v4
         with:
-          name: grim-bukkit-latest
+          name: GrimAC-Paper-26.3-Patched
           path: |
-            bukkit/build/libs/*.jar
-          if-no-files-found: warn
-
-      - name: Upload all jars
-        uses: actions/upload-artifact@v4
-        with:
-          name: grim-all-jars-latest
-          path: |
-            **/build/libs/*.jar
-          if-no-files-found: warn
+            output/GrimAC-Paper-26.3.jar
+            output/build-info.txt
+          if-no-files-found: error
+          retention-days: 30
